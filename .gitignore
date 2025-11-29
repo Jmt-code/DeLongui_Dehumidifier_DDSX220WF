@@ -1,0 +1,30 @@
+# Archivos con datos privados
+backend/.env
+backend/refresh_token.txt
+.env
+
+# Node modules
+node_modules/
+*/node_modules/
+
+# Distribuciones compiladas
+electron-app/dist/
+frontend/dist/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporales
+*.tmp
+*.temp

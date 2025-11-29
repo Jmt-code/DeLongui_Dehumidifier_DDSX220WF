@@ -1,0 +1,72 @@
+{
+  "name": "delonghi-dehumidifier-control",
+  "version": "1.0.0",
+  "description": "Remote control for De'Longhi WiFi dehumidifier",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder",
+    "build:win": "electron-builder --win --publish never"
+  },
+  "keywords": [
+    "delonghi",
+    "dehumidifier",
+    "iot"
+  ],
+  "author": "JuanMa",
+  "license": "MIT",
+  "type": "commonjs",
+  "build": {
+    "appId": "com.juanma.delonghi-dehumidifier",
+    "productName": "DeLonghi_Dehumidifier_Control",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js"
+    ],
+    "extraResources": [
+      {
+        "from": "../backend/server_v3.js",
+        "to": "backend/server_v3.js"
+      },
+      {
+        "from": "../backend/package.json",
+        "to": "backend/package.json"
+      },
+      {
+        "from": "../backend/node_modules",
+        "to": "backend/node_modules"
+      },
+      {
+        "from": "../frontend/dist",
+        "to": "frontend/dist"
+      }
+    ],
+    "asarUnpack": [
+      "**/*.node"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "dir",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "signAndEditExecutable": false
+    },
+    "portable": {
+      "artifactName": "DeLonghi-Control-${version}.exe"
+    }
+  },
+  "devDependencies": {
+    "electron": "^39.2.4",
+    "electron-builder": "^26.0.12"
+  },
+  "dependencies": {
+    "serve": "^14.2.0"
+  }
+}
