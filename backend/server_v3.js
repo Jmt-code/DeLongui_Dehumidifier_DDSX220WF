@@ -6,7 +6,8 @@ const path = require('path');
 require('dotenv').config();
 
 const app = express();
-app.use(cors());
+// Only the local frontend (Vite dev server / Electron static server) may call the API
+app.use(cors({ origin: ['http://localhost:5173', 'http://127.0.0.1:5173'] }));
 app.use(express.json());
 
 // Constantes de la API De'Longhi/Ayla Networks (del cliente Python)
@@ -51,6 +52,7 @@ function getQueryParam(url, param) {
 
 // Guardar/cargar refresh token
 function saveRefreshToken(token) {
+  if (!token) return;
   fs.writeFileSync(REFRESH_TOKEN_FILE, token);
 }
 
@@ -280,8 +282,6 @@ async function authenticateFullFlow(email, password, language = 'es') {
 
     // Step 8: Exchange IDP token for Ayla token
     console.log('\n📍 Step 8: Exchanging for Ayla token...');
-    console.log('   Token a enviar:', idpToken);
-    console.log('   URL:', `${AYLA_USER_URL}api/v1/token_sign_in`);
     
     try {
       // Intentar primero con form-urlencoded (como en Python)
@@ -302,7 +302,6 @@ async function authenticateFullFlow(email, password, language = 'es') {
       );
 
       console.log('✅ Ayla token obtained successfully!');
-      console.log('   Respuesta:', JSON.stringify(aylaResponse.data, null, 2));
       
       // Guardar refresh token
       saveRefreshToken(aylaResponse.data.refresh_token);
@@ -375,12 +374,6 @@ async function authenticateFullFlow(email, password, language = 'es') {
       }
     }
 
-    return {
-      accessToken: aylaResponse.data.access_token,
-      refreshToken: aylaResponse.data.refresh_token,
-      expiresIn: aylaResponse.data.expires_in || 86400
-    };
-
   } catch (error) {
     console.error('❌ Authentication error:', error.response?.data || error.message);
     throw error;
@@ -428,10 +421,7 @@ async function authenticate(email, password) {
   if (savedRefreshToken) {
     try {
       console.log('🔑 Trying with saved refresh token...');
-      const tokens = await refreshAccessToken(savedRefreshToken);
-      authState.aylaToken = tokens.accessToken;
-      authState.refreshToken = tokens.refreshToken;
-      authState.expiresAt = Date.now() + (tokens.expiresIn * 1000);
+      setTokens(await refreshAccessToken(savedRefreshToken));
       return true;
     } catch (e) {
       console.log('⚠️ Invalid refresh token, doing full login...\n');
@@ -439,55 +429,113 @@ async function authenticate(email, password) {
   }
 
   // If no refresh token or failed, do full login
-  const tokens = await authenticateFullFlow(email, password);
-  authState.aylaToken = tokens.accessToken;
-  authState.refreshToken = tokens.refreshToken;
-  authState.expiresAt = Date.now() + (tokens.expiresIn * 1000);
+  setTokens(await authenticateFullFlow(email, password));
   return true;
 }
 
+function setTokens(tokens) {
+  authState.aylaToken = tokens.accessToken;
+  authState.refreshToken = tokens.refreshToken;
+  authState.expiresAt = Date.now() + (tokens.expiresIn * 1000);
+}
+
+// Refresh the Ayla token a few minutes before it expires
+async function ensureFreshToken() {
+  const margin = 5 * 60 * 1000;
+  if (!authState.refreshToken || !authState.expiresAt || Date.now() < authState.expiresAt - margin) {
+    return;
+  }
+  try {
+    setTokens(await refreshAccessToken(authState.refreshToken));
+  } catch (e) {
+    console.log('⚠️ Proactive token refresh failed:', e.message);
+  }
+}
+
+// Ayla request; on 401 refreshes the token once and retries
+async function aylaRequest(config) {
+  try {
+    return await axios({ ...config, headers: getAylaHeaders() });
+  } catch (error) {
+    if (error.response?.status === 401 && authState.refreshToken) {
+      console.log('🔄 Ayla returned 401, refreshing token and retrying...');
+      setTokens(await refreshAccessToken(authState.refreshToken));
+      return axios({ ...config, headers: getAylaHeaders() });
+    }
+    throw error;
+  }
+}
+
+// Ayla sometimes returns the string "null" for empty values
+const cleanValue = (value) => (value === 'null' || value === undefined ? null : value);
+
 // Get devices
 async function getDevices() {
-  const response = await axios.get(
-    `${AYLA_BASE_URL}apiv1/devices.json`,
-    { headers: getAylaHeaders() }
-  );
-  
-  authState.devices = response.data.map(d => ({
-    dsn: d.device.dsn,
-    productName: d.device.product_name,
-    model: d.device.model,
-    connectionStatus: d.device.connection_status,
-    lanEnabled: d.device.lan_enabled
+  const response = await aylaRequest({ method: 'get', url: `${AYLA_BASE_URL}apiv1/devices.json` });
+
+  authState.devices = response.data.map(({ device: d }) => ({
+    dsn: d.dsn,
+    productName: d.product_name,
+    model: d.model,
+    oemModel: cleanValue(d.oem_model),
+    connectionStatus: d.connection_status,
+    connectedAt: cleanValue(d.connected_at),
+    lanEnabled: d.lan_enabled,
+    lanIp: cleanValue(d.lan_ip),
+    mac: cleanValue(d.mac),
+    swVersion: cleanValue(d.sw_version)
   }));
-  
+
   return authState.devices;
 }
 
-// Get device properties
+// Get every property the device exposes, with metadata
 async function getDeviceProperties(dsn) {
-  const response = await axios.get(
-    `${AYLA_BASE_URL}apiv1/dsns/${dsn}/properties.json`,
-    { headers: getAylaHeaders() }
-  );
-  
-  const props = {};
-  response.data.forEach(p => {
-    props[p.property.name] = p.property.value;
+  const response = await aylaRequest({
+    method: 'get',
+    url: `${AYLA_BASE_URL}apiv1/dsns/${encodeURIComponent(dsn)}/properties.json`
   });
-  
-  return props;
+
+  return response.data.map(({ property: p }) => ({
+    name: p.name,
+    displayName: p.display_name || p.name,
+    value: cleanValue(p.value),
+    baseType: p.base_type,
+    // 'output' = reported by the device, 'input' = can be set from the cloud
+    direction: p.direction,
+    updatedAt: cleanValue(p.data_updated_at)
+  }));
+}
+
+// Get recent datapoints of a property, oldest first
+async function getPropertyHistory(dsn, propertyName, limit) {
+  const response = await aylaRequest({
+    method: 'get',
+    url: `${AYLA_BASE_URL}apiv1/dsns/${encodeURIComponent(dsn)}/properties/${propertyName}/datapoints.json`,
+    params: { limit }
+  });
+
+  return response.data
+    .map(({ datapoint: dp }) => ({ value: Number(dp.value), time: dp.created_at }))
+    .filter(dp => Number.isFinite(dp.value) && dp.time)
+    .sort((a, b) => new Date(a.time) - new Date(b.time));
 }
 
 // Set device property
 async function setDeviceProperty(dsn, propertyName, value) {
-  const response = await axios.post(
-    `${AYLA_BASE_URL}apiv1/dsns/${dsn}/properties/${propertyName}/datapoints.json`,
-    { datapoint: { value } },
-    { headers: getAylaHeaders() }
-  );
-  
+  const response = await aylaRequest({
+    method: 'post',
+    url: `${AYLA_BASE_URL}apiv1/dsns/${encodeURIComponent(dsn)}/properties/${propertyName}/datapoints.json`,
+    data: { datapoint: { value } }
+  });
+
   return response.data;
+}
+
+function sendError(res, error, context) {
+  console.error(`${context}:`, error.response?.data || error.message);
+  const status = error.response?.status === 401 ? 401 : 500;
+  res.status(status).json({ error: error.message });
 }
 
 // ============ ENDPOINTS DE LA API ============
@@ -498,17 +546,28 @@ app.post('/api/login', async (req, res) => {
     const { email, password } = req.body;
     const finalEmail = email || process.env.DELONGHI_EMAIL;
     const finalPassword = password || process.env.DELONGHI_PASSWORD;
-    
+
     if (!finalEmail || !finalPassword) {
       return res.status(400).json({ error: 'Email and password required' });
     }
-    
+
     await authenticate(finalEmail, finalPassword);
     res.json({ success: true, message: 'Authentication successful' });
   } catch (error) {
     console.error('Login error:', error.message);
     res.status(401).json({ error: error.message || 'Authentication error' });
   }
+});
+
+// Logout: forget tokens so the next start asks for credentials again
+app.post('/api/logout', (req, res) => {
+  authState = { aylaToken: null, refreshToken: null, devices: [], expiresAt: null };
+  try {
+    fs.rmSync(REFRESH_TOKEN_FILE, { force: true });
+  } catch (e) {
+    console.log('⚠️ Could not delete refresh token file:', e.message);
+  }
+  res.json({ success: true });
 });
 
 // Get authentication status
@@ -519,109 +578,134 @@ app.get('/api/auth/status', (req, res) => {
   });
 });
 
+// All device routes require a valid token
+app.use('/api/devices', async (req, res, next) => {
+  if (!authState.aylaToken) {
+    return res.status(401).json({ error: 'Not authenticated' });
+  }
+  await ensureFreshToken();
+  next();
+});
+
 // Get devices
 app.get('/api/devices', async (req, res) => {
   try {
-    if (!authState.aylaToken) {
-      return res.status(401).json({ error: 'Not authenticated' });
-    }
-    
-    const devices = await getDevices();
-    res.json(devices);
+    res.json(await getDevices());
   } catch (error) {
-    console.error('Error getting devices:', error.message);
-    res.status(500).json({ error: error.message });
+    sendError(res, error, 'Error getting devices');
   }
 });
 
 // Get device status
 app.get('/api/devices/:dsn/status', async (req, res) => {
   try {
-    if (!authState.aylaToken) {
-      return res.status(401).json({ error: 'Not authenticated' });
-    }
-    
-    const properties = await getDeviceProperties(req.params.dsn);
+    const list = await getDeviceProperties(req.params.dsn);
+    const properties = Object.fromEntries(list.map(p => [p.name, p.value]));
+    const lastUpdated = list
+      .filter(p => p.direction === 'output' && p.updatedAt)
+      .map(p => p.updatedAt)
+      .sort()
+      .pop() || null;
+
+    // DDSX220 reports current_humidity / room_temp (tenths of °C) / current_speed;
+    // the older names are kept as fallback for other models
     res.json({
       isOn: properties.set_status === 1,
-      humidity: properties.humidity_value,
+      humidity: properties.current_humidity ?? properties.humidity_value,
       targetHumidity: properties.humidity_setpoint,
-      temperature: properties.temperature_value,
+      temperature: properties.room_temp != null ? properties.room_temp / 10 : properties.temperature_value,
       mode: properties.device_mode,
-      fanSpeed: properties.fan_speed,
+      fanSpeed: properties.current_speed ?? properties.fan_speed,
       tankFull: properties.tank_full === 1,
-      filterStatus: properties.filter_clean
+      alarmState: properties.alarm_state ?? null,
+      filterAlarm: (properties.filter_change_alarm ?? properties.filter_clean) === 1,
+      eco: properties.set_eco === 1,
+      swing: properties.swing === 1,
+      lastUpdated
     });
   } catch (error) {
-    console.error('Error getting status:', error.message);
-    res.status(500).json({ error: error.message });
+    sendError(res, error, 'Error getting status');
+  }
+});
+
+// Get all raw properties reported by the device
+app.get('/api/devices/:dsn/properties', async (req, res) => {
+  try {
+    res.json(await getDeviceProperties(req.params.dsn));
+  } catch (error) {
+    sendError(res, error, 'Error getting properties');
+  }
+});
+
+// Get history of a numeric property (e.g. humidity_value)
+app.get('/api/devices/:dsn/history/:property', async (req, res) => {
+  const { property } = req.params;
+  if (!/^[A-Za-z0-9_]+$/.test(property)) {
+    return res.status(400).json({ error: 'Invalid property name' });
+  }
+  // Ayla rejects (422) more than 100 datapoints per request
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 100);
+
+  try {
+    res.json(await getPropertyHistory(req.params.dsn, property, limit));
+  } catch (error) {
+    sendError(res, error, 'Error getting history');
   }
 });
 
 // Turn on device
 app.post('/api/devices/:dsn/on', async (req, res) => {
   try {
-    if (!authState.aylaToken) {
-      return res.status(401).json({ error: 'Not authenticated' });
-    }
-    
     await setDeviceProperty(req.params.dsn, 'set_status', 1);
     res.json({ success: true, message: 'Device turned on' });
   } catch (error) {
-    console.error('Error turning on:', error.message);
-    res.status(500).json({ error: error.message });
+    sendError(res, error, 'Error turning on');
   }
 });
 
 // Turn off device
 app.post('/api/devices/:dsn/off', async (req, res) => {
   try {
-    if (!authState.aylaToken) {
-      return res.status(401).json({ error: 'Not authenticated' });
-    }
-    
     await setDeviceProperty(req.params.dsn, 'set_status', 2);
     res.json({ success: true, message: 'Device turned off' });
   } catch (error) {
-    console.error('Error turning off:', error.message);
-    res.status(500).json({ error: error.message });
+    sendError(res, error, 'Error turning off');
   }
 });
 
 // Change mode
 app.post('/api/devices/:dsn/mode', async (req, res) => {
+  const mode = Number(req.body?.mode);
+  if (![1, 2, 3].includes(mode)) {
+    return res.status(400).json({ error: 'Mode must be 1, 2 or 3' });
+  }
+
   try {
-    if (!authState.aylaToken) {
-      return res.status(401).json({ error: 'Not authenticated' });
-    }
-    
-    const { mode } = req.body;
     await setDeviceProperty(req.params.dsn, 'device_mode', mode);
     res.json({ success: true, message: `Mode changed to ${mode}` });
   } catch (error) {
-    console.error('Error changing mode:', error.message);
-    res.status(500).json({ error: error.message });
+    sendError(res, error, 'Error changing mode');
   }
 });
 
 // Set target humidity
 app.post('/api/devices/:dsn/humidity', async (req, res) => {
+  const humidity = Number(req.body?.humidity);
+  if (!Number.isInteger(humidity) || humidity < 30 || humidity > 80) {
+    return res.status(400).json({ error: 'Humidity must be an integer between 30 and 80' });
+  }
+
   try {
-    if (!authState.aylaToken) {
-      return res.status(401).json({ error: 'Not authenticated' });
-    }
-    
-    const { humidity } = req.body;
     await setDeviceProperty(req.params.dsn, 'humidity_setpoint', humidity);
     res.json({ success: true, message: `Target humidity: ${humidity}%` });
   } catch (error) {
-    console.error('Error setting humidity:', error.message);
-    res.status(500).json({ error: error.message });
+    sendError(res, error, 'Error setting humidity');
   }
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
+// Bind to loopback only: anyone on the LAN could otherwise control the device
+app.listen(PORT, '127.0.0.1', () => {
   console.log(`🚀 Server running at http://localhost:${PORT}`);
   console.log(`📱 De'Longhi DDSX220WFA Control API`);
   console.log(`📝 Flujo OIDC completo implementado\n`);
