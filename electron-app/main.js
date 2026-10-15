@@ -80,7 +80,7 @@ function createSplashWindow() {
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 420,
-    height: 780,
+    height: 860,
     minWidth: 380,
     minHeight: 700,
     show: false,
@@ -176,11 +176,15 @@ function startBackend() {
     const backendPath = getResourcePath('backend');
     console.log('Backend path:', backendPath);
 
-    backendProcess = spawn('node', ['server_v3.js'], {
+    // Run the backend with Electron's own Node runtime, so Node doesn't need to be installed
+    backendProcess = spawn(process.execPath, ['server_v3.js'], {
       cwd: backendPath,
-      shell: true,
       stdio: 'pipe',
-      env: { ...process.env, NODE_ENV: isDev ? 'development' : 'production' }
+      env: {
+        ...process.env,
+        ELECTRON_RUN_AS_NODE: '1',
+        NODE_ENV: isDev ? 'development' : 'production'
+      }
     });
 
     backendProcess.stdout.on('data', (data) => {
@@ -228,11 +232,25 @@ function startStaticServer() {
     };
 
     staticServer = http.createServer((req, res) => {
-      let filePath = req.url === '/' ? '/index.html' : req.url;
-      filePath = path.join(frontendPath, filePath);
+      let urlPath;
+      try {
+        urlPath = decodeURIComponent(new URL(req.url, 'http://localhost').pathname);
+      } catch (e) {
+        res.writeHead(400);
+        res.end('Bad Request');
+        return;
+      }
+      let filePath = path.join(frontendPath, urlPath === '/' ? 'index.html' : urlPath);
+
+      // Never serve anything outside the frontend folder
+      if (!filePath.startsWith(frontendPath + path.sep)) {
+        res.writeHead(403);
+        res.end('Forbidden');
+        return;
+      }
 
       // Si no existe el archivo, servir index.html (SPA)
-      if (!fs.existsSync(filePath)) {
+      if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
         filePath = path.join(frontendPath, 'index.html');
       }
 
@@ -250,7 +268,7 @@ function startStaticServer() {
       });
     });
 
-    staticServer.listen(5173, () => {
+    staticServer.listen(5173, '127.0.0.1', () => {
       console.log('Frontend server at http://localhost:5173');
       resolve();
     });

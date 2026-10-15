@@ -63,10 +63,10 @@
     }
   },
   "devDependencies": {
-    "electron": "^39.2.4",
-    "electron-builder": "^26.0.12"
+    "electron": "^39.8.10",
+    "electron-builder": "^26.15.3"
   },
   "dependencies": {
-    "serve": "^14.2.0"
+    "serve": "^14.2.6"
   }
 }
