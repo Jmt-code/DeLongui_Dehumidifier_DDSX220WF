@@ -42,6 +42,16 @@ When you check "Remember me" in the app:
 
 **Recommendation:** Only use "Remember me" on trusted computers.
 
+## 🌐 Network exposure
+
+- The backend (`:3001`) and the Electron static server (`:5173`) bind to `127.0.0.1`, so other devices on your network cannot reach them.
+- The backend accepts cross-origin requests only from `http://localhost:5173` (the app's own UI).
+- The static server refuses paths outside the built frontend folder.
+
+## 🚪 Signing out
+
+"Sign out" clears the saved credentials in the UI, drops the backend session and deletes `backend/refresh_token.txt`.
+
 ## 🛡️ Protection with .gitignore
 
 The `.gitignore` file in the root protects:
